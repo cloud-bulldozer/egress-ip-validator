@@ -1,4 +1,4 @@
-FROM golang:1.22.1
+FROM docker.io/library/golang:latest
 
 WORKDIR /app
 COPY go.mod go.sum ./
