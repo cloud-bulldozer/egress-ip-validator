@@ -3,7 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -123,7 +123,7 @@ func checkEIPAndNonEIPUntilStop(stop <-chan struct{}, wg *sync.WaitGroup, egress
 				log.Printf("Error: Failed to talk to %q: %v", url, err)
 			} else {
 				if res.StatusCode == http.StatusOK {
-					resBody, err := ioutil.ReadAll(res.Body)
+					resBody, err := io.ReadAll(res.Body)
 					if err != nil {
 						log.Printf("Error: %v, while calling ioutil.ReadAll", err)
 					} else {
