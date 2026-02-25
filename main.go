@@ -23,13 +23,33 @@ const (
 	serverEnvKey              = "EXT_SERVER_HOST"
 	portEnvKey                = "EXT_SERVER_PORT"
 	egressIPsEnvKey           = "EGRESS_IPS"
-	hostSubnetEnvKey           = "HOST_SUBNET"
+	hostSubnetEnvKey          = "HOST_SUBNET"
 	delayBetweenRequestEnvKey = "DELAY_BETWEEN_REQ_SEC"
 	reqTimeoutEnvKey          = "REQ_TIMEOUT_SEC"
 	envKeyErrMsg              = "define env key %q"
 	defaultDelayBetweenReqSec = 1
 	defaultRequestTimeoutSec  = 1
 )
+
+// IPType represents whether the source IP is an Egress IP, a Node IP, or neither.
+type IPType int
+
+const (
+	IPTypeInvalid IPType = iota
+	IPTypeEgress
+	IPTypeNode
+)
+
+func (t IPType) String() string {
+	switch t {
+	case IPTypeEgress:
+		return "EgressIP"
+	case IPTypeNode:
+		return "NodeIP"
+	default:
+		return "Invalid"
+	}
+}
 
 func main() {
 	wg := &sync.WaitGroup{}
@@ -42,46 +62,52 @@ func main() {
 	startupNonEIPTick, eipStartUpLatency, eipRecoveryLatency, eipTick, nonEIPTick, failure := buildAndRegisterMetrics(delayBetweenReq)
 	wg.Add(2)
 	startMetricsServer(stop, wg)
-	// begin requests until Egress IP found
 	wg.Add(1)
 	go checkEIPAndNonEIPUntilStop(stop, wg, egressIPs, hostSubnetStr, extHost, extPort, eipStartUpLatency, eipRecoveryLatency, startupNonEIPTick, eipTick, nonEIPTick, failure, delayBetweenReq, timeout)
 	wg.Wait()
 }
 
-// validate hostip or eip
-func validateIPAddress(ipAddr string, egressIPs map[string]struct{}, subnet string) bool {
-    if len(egressIPs) > 0 {
-	if _, ok := egressIPs[ipAddr]; ok {
-	    return true
-	}
-    } else {
+// validateIPAddress checks whether ipAddr is a valid egress IP or a node IP (within the host subnet).
+// It returns:
+//   - valid bool   : true if the IP is either an egress IP or a node IP
+//   - ipType IPType: IPTypeEgress, IPTypeNode, or IPTypeInvalid
+func validateIPAddress(ipAddr string, egressIPs map[string]struct{}, subnet string) (bool, IPType) {
 	ip := net.ParseIP(ipAddr)
 	if ip == nil {
-	    log.Printf("Error:  IP Address is nil")
-	    return false
+		log.Printf("Error: IP Address %q could not be parsed", ipAddr)
+		return false, IPTypeInvalid
 	}
-	// Parse the subnet
-	_, ipNet, err := net.ParseCIDR(subnet)
-	if err != nil {
-	    log.Printf("Error:  Failed to parse subnet: %v", err)
-            return false
+
+	// Check against the known egress IPs first.
+	if len(egressIPs) > 0 {
+		if _, ok := egressIPs[ipAddr]; ok {
+			return true, IPTypeEgress
+		}
 	}
-        // Check if the IP address is within the subnet
-	return ipNet.Contains(ip)
-    }
-    return false
+
+	// If a host subnet is provided, check whether the IP falls within it (node IP).
+	if subnet != "" {
+		_, ipNet, err := net.ParseCIDR(subnet)
+		if err != nil {
+			log.Printf("Error: Failed to parse subnet %q: %v", subnet, err)
+			return false, IPTypeInvalid
+		}
+		if ipNet.Contains(ip) {
+			return true, IPTypeNode
+		}
+	}
+
+	return false, IPTypeInvalid
 }
 
-
 func checkEIPAndNonEIPUntilStop(stop <-chan struct{}, wg *sync.WaitGroup, egressIPs map[string]struct{}, hostSubnetStr string, extHost, extPort string,
-        eipStartUpLatency, eipRecoveryLatency *prometheus.Gauge, startupNonEIPTick, eipTick, nonEIPTick *prometheus.Gauge, failure *prometheus.Gauge, delayBetweenReq, timeout int) {
-	log.Print("## checkEIPAndNonEIPUntilStop: Polling source IP and increment metric counts for when Egress IP or another IP seen as source IP")
+	eipStartUpLatency, eipRecoveryLatency *prometheus.Gauge, startupNonEIPTick, eipTick, nonEIPTick *prometheus.Gauge, failure *prometheus.Gauge, delayBetweenReq, timeout int) {
+	log.Print("## checkEIPAndNonEIPUntilStop: Polling source IP and incrementing metric counts for Egress IP or Node IP seen as source IP")
 	defer wg.Done()
 	var done bool
 	start := time.Now()
 	var eipCheckFailed bool
 	var startupLatencySet bool
-	var valid bool
 	client := getHTTPClient(timeout)
 
 	for !done {
@@ -89,57 +115,67 @@ func checkEIPAndNonEIPUntilStop(stop <-chan struct{}, wg *sync.WaitGroup, egress
 		case <-stop:
 			done = true
 		default:
-			// Create a new request
 			url := buildDstURL(extHost, extPort)
 			res, err := client.Get(url)
+			var ipType IPType
+
 			if err != nil {
 				log.Printf("Error: Failed to talk to %q: %v", url, err)
 			} else {
 				if res.StatusCode == http.StatusOK {
 					resBody, err := ioutil.ReadAll(res.Body)
 					if err != nil {
-						log.Printf("Error: %v , while calling ioutil.ReadAll", err)
+						log.Printf("Error: %v, while calling ioutil.ReadAll", err)
 					} else {
-						valid = validateIPAddress(string(resBody), egressIPs, hostSubnetStr)
+						sourceIP := strings.TrimSpace(string(resBody))
+						var valid bool
+						valid, ipType = validateIPAddress(sourceIP, egressIPs, hostSubnetStr)
+						log.Printf("Source IP: %s, Type: %s, Valid: %v", sourceIP, ipType, valid)
 					}
 				} else {
 					log.Printf("res.StatusCode %d", res.StatusCode)
 					err = errors.New(fmt.Sprintf("res.StatusCode %d", res.StatusCode))
 				}
-			    res.Body.Close()
+				res.Body.Close()
 			}
+
 			if err != nil {
-				if eipCheckFailed == false {
+				if !eipCheckFailed {
 					eipCheckFailed = true
 					start = time.Now()
 				}
 				(*failure).Inc()
 			} else {
-				if valid {
-					if startupLatencySet == false {
+				switch ipType {
+				case IPTypeEgress:
+					(*eipTick).Inc()
+					if !startupLatencySet {
 						(*eipStartUpLatency).Set(time.Now().Sub(start).Seconds())
-						log.Printf("Startup Latency %v", time.Now().Sub(start).Seconds())
+						log.Printf("Startup Latency: %v seconds", time.Now().Sub(start).Seconds())
 						startupLatencySet = true
-					} else {
-						if eipCheckFailed == true {
-							eipCheckFailed = false
-							(*eipRecoveryLatency).Set(time.Now().Sub(start).Seconds())
-							log.Printf("Failover Latency %v", time.Now().Sub(start).Seconds())
-							start = time.Now()
-						}
+					} else if eipCheckFailed {
+						eipCheckFailed = false
+						(*eipRecoveryLatency).Set(time.Now().Sub(start).Seconds())
+						log.Printf("Failover/Recovery Latency: %v seconds", time.Now().Sub(start).Seconds())
+						start = time.Now()
 					}
-				} else {
-					if startupLatencySet == false {
+
+				case IPTypeNode:
+					log.Printf("Node IP detected as source — egress IP not yet active or failed over")
+					(*nonEIPTick).Inc()
+					if !startupLatencySet {
 						(*startupNonEIPTick).Inc()
-					} else {
-						if eipCheckFailed == false {
-							eipCheckFailed = true
-							start = time.Now()
-						}
-						(*nonEIPTick).Inc()
+					} else if !eipCheckFailed {
+						eipCheckFailed = true
+						start = time.Now()
 					}
+
+				case IPTypeInvalid:
+					log.Printf("Invalid or unrecognized source IP")
+					(*failure).Inc()
 				}
 			}
+
 			if delayBetweenReq != 0 {
 				time.Sleep(time.Duration(delayBetweenReq) * time.Second)
 			}
@@ -163,12 +199,11 @@ func getHTTPClient(timeout int) http.Client {
 }
 
 func buildEIPMap(egressIPsStr string) map[string]struct{} {
-	// build map of egress IPs
 	egressIPs := strings.Split(egressIPsStr, ",")
 	egressIPMap := make(map[string]struct{})
 	for _, egressIP := range egressIPs {
 		if ip := net.ParseIP(egressIP); ip == nil {
-			panic(fmt.Sprintf("invalid egress IPs - comma seperated list allowed: %q", egressIPsStr))
+			panic(fmt.Sprintf("invalid egress IPs - comma separated list allowed: %q", egressIPsStr))
 		}
 		egressIPMap[egressIP] = struct{}{}
 	}
@@ -225,18 +260,15 @@ func registerSignalHandler() chan struct{} {
 }
 
 func startMetricsServer(stop <-chan struct{}, wg *sync.WaitGroup) {
-	// build metrics server
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
 	server := &http.Server{Addr: ":8080", Handler: mux}
-	// start metrics server
 	go func() {
 		defer wg.Done()
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			panic(err.Error())
 		}
 	}()
-	// stop server when done triggered
 	go func() {
 		defer wg.Done()
 		<-stop
@@ -275,15 +307,15 @@ func buildAndRegisterMetrics(delayBetweenReq int) (*prometheus.Gauge, *prometheu
 	var nonEIPTick = prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace: "scale",
 		Name:      "non_eip_total",
-		Help:      fmt.Sprintf("increments every time EgressIP not seen as source IP - increments every %d seconds if seen", delayBetweenReq),
+		Help:      fmt.Sprintf("increments every time EgressIP not seen as source IP (Node IP seen instead) - increments every %d seconds if seen", delayBetweenReq),
 	})
 
 	var failure = prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace: "scale",
 		Name:      "failure_total",
-		Help:      fmt.Sprintf("increments every time there is a connection failure - increments every %d seconds if seen", delayBetweenReq),
+		Help:      fmt.Sprintf("increments every time there is a connection failure or unrecognized IP - increments every %d seconds if seen", delayBetweenReq),
 	})
-	// create metrics registry and register metrics
+
 	prometheus.MustRegister(startupNonEIPTick)
 	prometheus.MustRegister(eipStartUpLatency)
 	prometheus.MustRegister(eipRecoveryLatency)
