@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -50,6 +49,18 @@ func (t IPType) String() string {
 		return "Invalid"
 	}
 }
+
+// connState represents the current phase of the egress IP connection lifecycle.
+type connState int
+
+const (
+	// stateStartup: we haven't seen the egress IP yet since the program started.
+	stateStartup connState = iota
+	// stateStable: egress IP is healthy and being seen as the source IP.
+	stateStable
+	// stateFailed: egress IP was previously seen but is no longer the source IP.
+	stateFailed
+)
 
 func main() {
 	wg := &sync.WaitGroup{}
@@ -104,88 +115,147 @@ func checkEIPAndNonEIPUntilStop(stop <-chan struct{}, wg *sync.WaitGroup, egress
 	eipStartUpLatency, eipRecoveryLatency *prometheus.Gauge, startupNonEIPTick, eipTick, nonEIPTick *prometheus.Gauge, failure *prometheus.Gauge, delayBetweenReq, timeout int) {
 	log.Print("## checkEIPAndNonEIPUntilStop: Polling source IP and incrementing metric counts for Egress IP or Node IP seen as source IP")
 	defer wg.Done()
-	var done bool
-	start := time.Now()
-	var eipCheckFailed bool
-	var startupLatencySet bool
-	client := getHTTPClient(timeout)
 
-	for !done {
+	client := getHTTPClient(timeout)
+	state := stateStartup
+	start := time.Now()
+
+	for {
 		select {
 		case <-stop:
-			done = true
+			log.Print("Finished polling source IP")
+			return
 		default:
-			url := buildDstURL(extHost, extPort)
-			res, err := client.Get(url)
-			var ipType IPType
+		}
 
-			if err != nil {
-				log.Printf("Error: Failed to talk to %q: %v", url, err)
-			} else {
-				if res.StatusCode == http.StatusOK {
-					resBody, err := io.ReadAll(res.Body)
-					if err != nil {
-						log.Printf("Error: %v, while calling ioutil.ReadAll", err)
-					} else {
-						sourceIP := strings.TrimSpace(string(resBody))
-						var valid bool
-						valid, ipType = validateIPAddress(sourceIP, egressIPs, hostSubnetStr)
-						log.Printf("Source IP: %s, Type: %s, Valid: %v", sourceIP, ipType, valid)
-					}
-				} else {
-					log.Printf("res.StatusCode %d", res.StatusCode)
-					err = errors.New(fmt.Sprintf("res.StatusCode %d", res.StatusCode))
-				}
-				res.Body.Close()
-			}
+		ipType, err := fetchSourceIPType(client, extHost, extPort, egressIPs, hostSubnetStr)
+		log.Printf("State: %v, IP type: %s, err: %v", state, ipType, err)
 
-			if err != nil {
-				if !eipCheckFailed {
-					eipCheckFailed = true
-					start = time.Now()
-				}
-				(*failure).Inc()
-			} else {
-				switch ipType {
-				case IPTypeEgress:
-					(*eipTick).Inc()
-					if !startupLatencySet {
-						(*eipStartUpLatency).Set(time.Now().Sub(start).Seconds())
-						log.Printf("Startup Latency: %v seconds", time.Now().Sub(start).Seconds())
-						startupLatencySet = true
-					} else if eipCheckFailed {
-						eipCheckFailed = false
-						(*eipRecoveryLatency).Set(time.Now().Sub(start).Seconds())
-						log.Printf("Failover/Recovery Latency: %v seconds", time.Now().Sub(start).Seconds())
-						start = time.Now()
-					}
+		switch state {
+		case stateStartup:
+			state = handleStartup(ipType, err, start, state, eipStartUpLatency, startupNonEIPTick, failure)
 
-				case IPTypeNode:
-					log.Printf("Node IP detected as source — egress IP not yet active or failed over")
-					(*nonEIPTick).Inc()
-					if !startupLatencySet {
-						(*startupNonEIPTick).Inc()
-					} else if !eipCheckFailed {
-						eipCheckFailed = true
-						start = time.Now()
-					}
+		case stateStable:
+			state, start = handleStable(ipType, err, start, state, eipTick, nonEIPTick, failure)
 
-				case IPTypeInvalid:
-					log.Printf("Invalid or unrecognized source IP")
-					(*failure).Inc()
-				}
-			}
+		case stateFailed:
+			state, start = handleFailed(ipType, err, start, state, eipRecoveryLatency, eipTick, nonEIPTick, failure)
+		}
 
-			if delayBetweenReq != 0 {
-				time.Sleep(time.Duration(delayBetweenReq) * time.Second)
-			}
+		if delayBetweenReq != 0 {
+			time.Sleep(time.Duration(delayBetweenReq) * time.Second)
 		}
 	}
-	log.Print("Finished polling source IP")
 }
 
-func isIP(s string) bool {
-	return net.ParseIP(s) != nil
+// fetchSourceIPType makes a single HTTP request and returns the IPType of the source IP.
+// Any connection error or non-200 response returns IPTypeInvalid with a non-nil error.
+// The body read error also returns IPTypeInvalid but is not a connection-level failure,
+// so it is treated as a failure for metric purposes by the caller.
+func fetchSourceIPType(client http.Client, extHost, extPort string, egressIPs map[string]struct{}, hostSubnetStr string) (IPType, error) {
+	url := buildDstURL(extHost, extPort)
+	res, err := client.Get(url)
+	if err != nil {
+		log.Printf("Error: Failed to talk to %q: %v", url, err)
+		return IPTypeInvalid, err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		err = fmt.Errorf("unexpected status code: %d", res.StatusCode)
+		log.Printf("Error: %v", err)
+		return IPTypeInvalid, err
+	}
+
+	resBody, err := io.ReadAll(res.Body)
+	if err != nil {
+		log.Printf("Error: %v, while calling ioutil.ReadAll", err)
+		return IPTypeInvalid, err
+	}
+
+	sourceIP := strings.TrimSpace(string(resBody))
+	_, ipType := validateIPAddress(sourceIP, egressIPs, hostSubnetStr)
+	log.Printf("Source IP: %s, Type: %s", sourceIP, ipType)
+	return ipType, nil
+}
+
+// handleStartup processes one poll result during the startup phase.
+// Transitions to stateStable on first egress IP seen.
+func handleStartup(ipType IPType, err error, start time.Time, state connState, eipStartUpLatency, startupNonEIPTick, failure *prometheus.Gauge) connState {
+	if err != nil {
+		// Connection failures during startup: count as failure and keep waiting.
+		(*failure).Inc()
+		return stateStartup
+	}
+	switch ipType {
+	case IPTypeEgress:
+		// First egress IP seen — record startup latency and move to stable.
+		latency := time.Since(start).Seconds()
+		(*eipStartUpLatency).Set(latency)
+		log.Printf("Startup latency: %v seconds", latency)
+		return stateStable
+	case IPTypeNode:
+		// Node IP seen during startup — not an error, just not ready yet.
+		(*startupNonEIPTick).Inc()
+		return stateStartup
+	default:
+		// Unrecognized IP during startup — treat as failure.
+		(*failure).Inc()
+		return stateStartup
+	}
+}
+
+// handleStable processes one poll result during the stable phase.
+// Transitions to stateFailed if the egress IP is no longer seen.
+// Returns the new state and an updated failure-start timestamp if transitioning to failed.
+func handleStable(ipType IPType, err error, start time.Time, state connState, eipTick, nonEIPTick, failure *prometheus.Gauge) (connState, time.Time) {
+	if err != nil {
+		// Connection failure — begin tracking recovery time.
+		(*failure).Inc()
+		return stateFailed, time.Now()
+	}
+	switch ipType {
+	case IPTypeEgress:
+		// Still healthy.
+		(*eipTick).Inc()
+		return stateStable, start
+	case IPTypeNode:
+		// Egress IP has been replaced by node IP — begin tracking recovery time.
+		(*nonEIPTick).Inc()
+		return stateFailed, time.Now()
+	default:
+		// Unrecognized IP — treat as failure and begin tracking recovery time.
+		(*failure).Inc()
+		return stateFailed, time.Now()
+	}
+}
+
+// handleFailed processes one poll result during the failed phase.
+// Transitions back to stateStable when the egress IP is seen again.
+// Returns the new state and resets the start timestamp on recovery.
+func handleFailed(ipType IPType, err error, start time.Time, state connState, eipRecoveryLatency, eipTick, nonEIPTick, failure *prometheus.Gauge) (connState, time.Time) {
+	if err != nil {
+		// Still failing.
+		(*failure).Inc()
+		return stateFailed, start
+	}
+	switch ipType {
+	case IPTypeEgress:
+		// Egress IP is back — record recovery latency and return to stable.
+		latency := time.Since(start).Seconds()
+		(*eipRecoveryLatency).Set(latency)
+		(*eipTick).Inc()
+		log.Printf("Recovery latency: %v seconds", latency)
+		return stateStable, time.Now()
+	case IPTypeNode:
+		// Still seeing node IP instead of egress IP.
+		(*nonEIPTick).Inc()
+		return stateFailed, start
+	default:
+		// Still unrecognized.
+		(*failure).Inc()
+		return stateFailed, start
+	}
 }
 
 func buildDstURL(host, port string) string {
