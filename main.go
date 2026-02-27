@@ -226,7 +226,7 @@ func processEnvVars() (string, string, string, string, int, int) {
 	if extPort == "" {
 		panic(fmt.Sprintf(envKeyErrMsg, portEnvKey))
 	}
-	hostSubnetStr := ""
+	hostSubnetStr := os.Getenv(hostSubnetEnvKey)
 	egressIPsStr := os.Getenv(egressIPsEnvKey)
 	if egressIPsStr == "" {
 		hostSubnetStr = os.Getenv(hostSubnetEnvKey)
